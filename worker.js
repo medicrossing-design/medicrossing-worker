@@ -6,66 +6,52 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
-const LOOP_INTERVAL = 15000;
-
-// =============================
-// QUERY
-// =============================
-function buildQueries(med, country, domain) {
-  return [
-    `${med} travel ${country} medication rules site:${domain}`,
-    `${med} prescription required ${country} site:${domain}`,
-    `${med} controlled substance ${country} law site:${domain}`
-  ];
-}
+const LOOP_INTERVAL = 20000;
 
 // =============================
 // CLEAN
 // =============================
-function clean(html) {
-  return html
-    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, "")
+function clean(text) {
+  return text
     .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 3000);
+    .slice(0, 2000);
 }
 
 // =============================
-// FILTRO REAL (CORE)
+// FILTRO
 // =============================
-function isRegulatoryContent(text) {
+function isUseful(text) {
   const t = text.toLowerCase();
 
-  const signals = [
-    "prescription",
-    "controlled",
-    "allowed",
-    "prohibited",
-    "documentation",
-    "travel",
-    "bring medication"
-  ];
-
-  return signals.some(s => t.includes(s));
+  return (
+    t.includes("prescription") ||
+    t.includes("controlled") ||
+    t.includes("allowed") ||
+    t.includes("prohibited")
+  );
 }
 
 // =============================
-// GOOGLE PARSER
+// FETCH SIMPLES (SEM GOOGLE)
 // =============================
-function extractLinks(html) {
-  return [...html.matchAll(/href="\/url\?q=(https:\/\/[^&"]+)/g)]
-    .map(m => decodeURIComponent(m[1]))
-    .slice(0, 5);
+async function fetchPage(url) {
+  const res = await fetch(url, {
+    headers: { "User-Agent": "Mozilla/5.0" }
+  });
+
+  if (!res.ok) throw new Error("fail");
+
+  return await res.text();
 }
 
 // =============================
 // PROCESS
 // =============================
-async function processEvent(event) {
-  const med = event.normalized_key || event.medicine_name;
-  const country = event.destination_country;
+async function processEvent(ev) {
+  const med = ev.normalized_key || ev.medicine_name;
+  const country = ev.destination_country;
 
   console.log(`🔍 ${med} → ${country}`);
 
@@ -74,56 +60,43 @@ async function processEvent(event) {
     .select("*")
     .eq("country_code", country);
 
-  for (const source of sources || []) {
-    const domain = new URL(source.base_url).hostname;
+  for (const s of sources || []) {
+    try {
+      console.log("🌐 tentando:", s.base_url);
 
-    const queries = buildQueries(med, country, domain);
+      const html = await fetchPage(s.base_url);
+      const text = clean(html);
 
-    for (const q of queries) {
-      try {
-        const searchRes = await fetch(
-          `https://www.google.com/search?q=${encodeURIComponent(q)}`,
-          { headers: { "User-Agent": "Mozilla/5.0" } }
-        );
+      if (!isUseful(text)) continue;
 
-        const searchHtml = await searchRes.text();
-        const links = extractLinks(searchHtml);
+      await supabase.from("evidence_sources").insert({
+        source_name: s.source_name,
+        source_url: s.base_url,
+        content_snapshot: text,
+        content_hash: Buffer.from(text).toString("base64").slice(0, 50),
+        country_code: country
+      });
 
-        for (const link of links) {
-          const page = await fetch(link, {
-            headers: { "User-Agent": "Mozilla/5.0" }
-          });
+      console.log("✅ evidência salva");
 
-          const html = await page.text();
-          const cleaned = clean(html);
-
-          // 🔥 FILTRO CRÍTICO
-          if (!isRegulatoryContent(cleaned)) continue;
-
-          await supabase.from("evidence_sources").insert({
-            source_name: source.source_name,
-            source_url: link,
-            content_snapshot: cleaned,
-            content_hash: Buffer.from(cleaned).toString("base64").slice(0, 50),
-            country_code: country
-          });
-
-          console.log("✅ EVIDÊNCIA REAL");
-
-          return;
-        }
-      } catch (err) {
-        console.log("❌ falha");
-      }
+      break;
+    } catch (e) {
+      console.log("❌ falha fonte");
     }
   }
+
+  // 🔥 MARCA COMO PROCESSADO (CRÍTICO)
+  await supabase
+    .from("search_events")
+    .update({ result_status: "PROCESSED" })
+    .eq("id", ev.id);
 }
 
 // =============================
 // LOOP
 // =============================
 async function run() {
-  console.log("🚀 Worker REGULATORY iniciado");
+  console.log("🚀 Worker estável iniciado");
 
   while (true) {
     const { data } = await supabase
@@ -131,6 +104,10 @@ async function run() {
       .select("*")
       .eq("result_status", "NOT_FOUND_OR_INCONCLUSIVE")
       .limit(2);
+
+    if (!data || data.length === 0) {
+      console.log("😴 nada pendente");
+    }
 
     for (const ev of data || []) {
       await processEvent(ev);
