@@ -1,0 +1,13 @@
+{
+  "name": "medicrossing-worker",
+  "version": "1.0.0",
+  "main": "worker.js",
+  "type": "module",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.0.0",
+    "node-fetch": "^3.3.2"
+  }
+}
