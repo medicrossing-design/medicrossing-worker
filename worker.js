@@ -6,9 +6,19 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
-const BATCH_SIZE = 5;
-const LOOP_INTERVAL = 10000;
-const FETCH_TIMEOUT = 15000; // aumentamos para 15s
+const LOOP_INTERVAL = 15000;
+
+// =============================
+// GERAR QUERY INTELIGENTE
+// =============================
+function buildSearchQueries(medication, country) {
+  return [
+    `${medication} travel ${country} medication rules`,
+    `can I bring ${medication} to ${country}`,
+    `${medication} controlled substance ${country} law`,
+    `${medication} prescription requirement ${country}`
+  ];
+}
 
 // =============================
 // CLEAN HTML
@@ -24,119 +34,122 @@ function cleanHtml(html) {
 }
 
 // =============================
-// HASH
+// VALIDAR CONTEÚDO
 // =============================
-function generateHash(text) {
-  return Buffer.from(text).toString("base64").slice(0, 50);
+function isValidContent(text) {
+  if (!text || text.length < 200) return false;
+
+  const lower = text.toLowerCase();
+
+  const blacklist = [
+    "cookie",
+    "captcha",
+    "login",
+    "menu",
+    "navigation",
+    "challenge validation",
+    "enable javascript"
+  ];
+
+  return !blacklist.some(word => lower.includes(word));
 }
 
 // =============================
-// FETCH COM RETRY
+// FETCH
 // =============================
-async function fetchWithRetry(url, retries = 2) {
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
-
-      const res = await fetch(url, {
-        headers: {
-          "User-Agent": "Mozilla/5.0",
-          "Accept-Language": "en-US,en;q=0.9"
-        },
-        signal: controller.signal
-      });
-
-      clearTimeout(timeout);
-
-      if (!res.ok) throw new Error("HTTP " + res.status);
-
-      return await res.text();
-    } catch (err) {
-      console.log(`⚠️ tentativa ${i + 1} falhou:`, err.message);
-
-      if (i === retries) throw err;
-
-      await new Promise((r) => setTimeout(r, 2000));
+async function fetchPage(url) {
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Accept-Language": "en-US,en;q=0.9"
     }
-  }
+  });
+
+  if (!res.ok) throw new Error("HTTP " + res.status);
+
+  return await res.text();
 }
 
 // =============================
-// PROCESSAR
+// PROCESSAR UMA BUSCA REAL
 // =============================
-async function processEvidenceBatch() {
-  console.log("🔎 Buscando evidências...");
+async function processSearchEvent(event) {
+  const medication = event.normalized_key || event.medicine_name;
+  const country = event.destination_country;
 
-  const { data, error } = await supabase
-    .from("evidence_sources")
+  console.log(`🔍 ${medication} → ${country}`);
+
+  // 1. buscar fontes oficiais
+  const { data: sources } = await supabase
+    .from("official_sources")
     .select("*")
-    .eq("content_snapshot", "SNAPSHOT_NOT_CAPTURED_YET")
-    .order("created_at", { ascending: true })
-    .limit(BATCH_SIZE);
+    .eq("country_code", country)
+    .eq("is_active", true)
+    .order("priority_score", { ascending: false });
 
-  if (error) {
-    console.error("❌ erro:", error.message);
+  if (!sources || sources.length === 0) {
+    console.log("⚠️ sem fontes oficiais");
     return;
   }
 
-  if (!data || data.length === 0) {
-    console.log("😴 nada pendente");
-    return;
-  }
+  const queries = buildSearchQueries(medication, country);
 
-  for (const ev of data) {
-    console.log("🌐", ev.source_url);
+  for (const source of sources) {
+    for (const q of queries) {
+      const searchUrl = `${source.base_url}/search?q=${encodeURIComponent(q)}`;
 
-    try {
-      const html = await fetchWithRetry(ev.source_url);
+      try {
+        console.log(`🌐 ${source.source_name}`);
 
-      if (!html || html.length < 100) {
-        throw new Error("conteúdo inválido");
-      }
+        const html = await fetchPage(searchUrl);
+        const cleaned = cleanHtml(html);
 
-      const cleaned = cleanHtml(html);
-      const hash = generateHash(cleaned);
+        if (!isValidContent(cleaned)) continue;
 
-      await supabase
-        .from("evidence_sources")
-        .update({
+        // salvar evidência
+        await supabase.from("evidence_sources").insert({
+          source_name: source.source_name,
+          source_url: searchUrl,
           content_snapshot: cleaned,
-          content_hash: hash,
-          captured_at: new Date().toISOString()
-        })
-        .eq("id", ev.id);
+          content_hash: Buffer.from(cleaned).toString("base64").slice(0, 50),
+          source_type: source.source_type,
+          country_code: country
+        });
 
-      console.log("✅ salvo:", ev.id);
-    } catch (err) {
-      console.error("❌ falhou:", ev.id);
+        console.log("✅ evidência salva");
 
-      // 👇 MARCA COMO FALHA PRA NÃO LOOPAR
-      await supabase
-        .from("evidence_sources")
-        .update({
-          content_snapshot: "FAILED_TO_CAPTURE"
-        })
-        .eq("id", ev.id);
+        return; // para no primeiro válido
+      } catch (err) {
+        console.log("❌ falha tentativa");
+      }
     }
   }
 }
 
 // =============================
-// LOOP
+// LOOP PRINCIPAL
 // =============================
-async function startWorker() {
-  console.log("🚀 Worker iniciado");
+async function run() {
+  console.log("🚀 Search-driven worker iniciado");
 
   while (true) {
-    try {
-      await processEvidenceBatch();
-    } catch (err) {
-      console.error("🔥 erro loop:", err.message);
+    const { data } = await supabase
+      .from("search_events")
+      .select("*")
+      .eq("result_status", "NOT_FOUND_OR_INCONCLUSIVE")
+      .order("created_at", { ascending: true })
+      .limit(3);
+
+    if (!data || data.length === 0) {
+      console.log("😴 sem buscas pendentes");
     }
 
-    await new Promise((r) => setTimeout(r, LOOP_INTERVAL));
+    for (const event of data || []) {
+      await processSearchEvent(event);
+    }
+
+    await new Promise(r => setTimeout(r, LOOP_INTERVAL));
   }
 }
 
-startWorker();
+run();
