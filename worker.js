@@ -56,7 +56,7 @@ async function processEvidence() {
   const { data } = await supabase
     .from("evidence_sources")
     .select("*")
-    .is("classified", null)
+    .is("classified", false)
     .limit(3);
 
   for (const ev of data || []) {
