@@ -9,19 +9,18 @@ const supabase = createClient(
 const LOOP_INTERVAL = 15000;
 
 // =============================
-// GERAR QUERY INTELIGENTE
+// GERAR QUERY
 // =============================
-function buildSearchQueries(medication, country) {
+function buildSearchQueries(medication, country, domain) {
   return [
-    `${medication} travel ${country} medication rules`,
-    `can I bring ${medication} to ${country}`,
-    `${medication} controlled substance ${country} law`,
-    `${medication} prescription requirement ${country}`
+    `${medication} travel ${country} site:${domain}`,
+    `${medication} prescription requirement ${country} site:${domain}`,
+    `${medication} controlled substance ${country} site:${domain}`
   ];
 }
 
 // =============================
-// CLEAN HTML
+// LIMPAR HTML
 // =============================
 function cleanHtml(html) {
   return html
@@ -34,44 +33,48 @@ function cleanHtml(html) {
 }
 
 // =============================
-// VALIDAR CONTEÚDO
+// VALIDAR TEXTO
 // =============================
 function isValidContent(text) {
   if (!text || text.length < 200) return false;
 
   const lower = text.toLowerCase();
 
-  const blacklist = [
-    "cookie",
-    "captcha",
-    "login",
-    "menu",
-    "navigation",
-    "challenge validation",
-    "enable javascript"
-  ];
+  if (
+    lower.includes("cookie") ||
+    lower.includes("login") ||
+    lower.includes("menu") ||
+    lower.includes("navigation")
+  ) {
+    return false;
+  }
 
-  return !blacklist.some(word => lower.includes(word));
+  return true;
 }
 
 // =============================
-// FETCH
+// BUSCA GOOGLE (SIMPLES)
 // =============================
-async function fetchPage(url) {
+async function googleSearch(query) {
+  const url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+
   const res = await fetch(url, {
     headers: {
-      "User-Agent": "Mozilla/5.0",
-      "Accept-Language": "en-US,en;q=0.9"
+      "User-Agent": "Mozilla/5.0"
     }
   });
 
-  if (!res.ok) throw new Error("HTTP " + res.status);
+  const html = await res.text();
 
-  return await res.text();
+  // extrair links simples
+  const links = [...html.matchAll(/href="\/url\?q=(https:\/\/[^&"]+)/g)]
+    .map(m => decodeURIComponent(m[1]));
+
+  return links.slice(0, 3);
 }
 
 // =============================
-// PROCESSAR UMA BUSCA REAL
+// PROCESS SEARCH EVENT
 // =============================
 async function processSearchEvent(event) {
   const medication = event.normalized_key || event.medicine_name;
@@ -79,70 +82,63 @@ async function processSearchEvent(event) {
 
   console.log(`🔍 ${medication} → ${country}`);
 
-  // 1. buscar fontes oficiais
   const { data: sources } = await supabase
     .from("official_sources")
     .select("*")
-    .eq("country_code", country)
-    .eq("is_active", true)
-    .order("priority_score", { ascending: false });
+    .eq("country_code", country);
 
-  if (!sources || sources.length === 0) {
-    console.log("⚠️ sem fontes oficiais");
-    return;
-  }
+  for (const source of sources || []) {
+    const domain = new URL(source.base_url).hostname;
 
-  const queries = buildSearchQueries(medication, country);
+    const queries = buildSearchQueries(medication, country, domain);
 
-  for (const source of sources) {
     for (const q of queries) {
-      const searchUrl = `${source.base_url}/search?q=${encodeURIComponent(q)}`;
-
       try {
-        console.log(`🌐 ${source.source_name}`);
+        const links = await googleSearch(q);
 
-        const html = await fetchPage(searchUrl);
-        const cleaned = cleanHtml(html);
+        for (const link of links) {
+          console.log("🌐", link);
 
-        if (!isValidContent(cleaned)) continue;
+          const page = await fetch(link, {
+            headers: { "User-Agent": "Mozilla/5.0" }
+          });
 
-        // salvar evidência
-        await supabase.from("evidence_sources").insert({
-          source_name: source.source_name,
-          source_url: searchUrl,
-          content_snapshot: cleaned,
-          content_hash: Buffer.from(cleaned).toString("base64").slice(0, 50),
-          source_type: source.source_type,
-          country_code: country
-        });
+          const html = await page.text();
+          const cleaned = cleanHtml(html);
 
-        console.log("✅ evidência salva");
+          if (!isValidContent(cleaned)) continue;
 
-        return; // para no primeiro válido
+          await supabase.from("evidence_sources").insert({
+            source_name: source.source_name,
+            source_url: link,
+            content_snapshot: cleaned,
+            content_hash: Buffer.from(cleaned).toString("base64").slice(0, 50),
+            country_code: country
+          });
+
+          console.log("✅ evidência real salva");
+
+          return;
+        }
       } catch (err) {
-        console.log("❌ falha tentativa");
+        console.log("❌ falha query");
       }
     }
   }
 }
 
 // =============================
-// LOOP PRINCIPAL
+// LOOP
 // =============================
 async function run() {
-  console.log("🚀 Search-driven worker iniciado");
+  console.log("🚀 Worker V3 iniciado");
 
   while (true) {
     const { data } = await supabase
       .from("search_events")
       .select("*")
       .eq("result_status", "NOT_FOUND_OR_INCONCLUSIVE")
-      .order("created_at", { ascending: true })
       .limit(3);
-
-    if (!data || data.length === 0) {
-      console.log("😴 sem buscas pendentes");
-    }
 
     for (const event of data || []) {
       await processSearchEvent(event);
