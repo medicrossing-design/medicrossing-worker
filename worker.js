@@ -1,20 +1,17 @@
 import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
 
-// =============================
-// CONFIG
-// =============================
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
 
 const BATCH_SIZE = 5;
-const LOOP_INTERVAL = 10000; // 10s
-const FETCH_TIMEOUT = 8000; // 8s
+const LOOP_INTERVAL = 10000;
+const FETCH_TIMEOUT = 15000; // aumentamos para 15s
 
 // =============================
-// CLEAN HTML → TEXTO
+// CLEAN HTML
 // =============================
 function cleanHtml(html) {
   return html
@@ -27,39 +24,49 @@ function cleanHtml(html) {
 }
 
 // =============================
-// HASH SIMPLES (CONSISTENTE)
+// HASH
 // =============================
 function generateHash(text) {
   return Buffer.from(text).toString("base64").slice(0, 50);
 }
 
 // =============================
-// FETCH COM TIMEOUT
+// FETCH COM RETRY
 // =============================
-async function fetchWithTimeout(url) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+async function fetchWithRetry(url, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
 
-  try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; MediCrossingBot/1.0)"
-      },
-      signal: controller.signal
-    });
+      const res = await fetch(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+          "Accept-Language": "en-US,en;q=0.9"
+        },
+        signal: controller.signal
+      });
 
-    const text = await res.text();
-    return text;
-  } finally {
-    clearTimeout(timeout);
+      clearTimeout(timeout);
+
+      if (!res.ok) throw new Error("HTTP " + res.status);
+
+      return await res.text();
+    } catch (err) {
+      console.log(`⚠️ tentativa ${i + 1} falhou:`, err.message);
+
+      if (i === retries) throw err;
+
+      await new Promise((r) => setTimeout(r, 2000));
+    }
   }
 }
 
 // =============================
-// PROCESSAR EVIDÊNCIAS
+// PROCESSAR
 // =============================
 async function processEvidenceBatch() {
-  console.log("🔎 Buscando evidências pendentes...");
+  console.log("🔎 Buscando evidências...");
 
   const { data, error } = await supabase
     .from("evidence_sources")
@@ -69,27 +76,26 @@ async function processEvidenceBatch() {
     .limit(BATCH_SIZE);
 
   if (error) {
-    console.error("❌ Erro ao buscar evidências:", error.message);
+    console.error("❌ erro:", error.message);
     return;
   }
 
   if (!data || data.length === 0) {
-    console.log("😴 Nenhuma evidência pendente.");
+    console.log("😴 nada pendente");
     return;
   }
 
   for (const ev of data) {
-    console.log(`🌐 Capturando: ${ev.source_url}`);
+    console.log("🌐", ev.source_url);
 
     try {
-      const rawHtml = await fetchWithTimeout(ev.source_url);
+      const html = await fetchWithRetry(ev.source_url);
 
-      if (!rawHtml || rawHtml.length < 50) {
-        console.log("⚠️ Conteúdo muito curto, ignorando:", ev.id);
-        continue;
+      if (!html || html.length < 100) {
+        throw new Error("conteúdo inválido");
       }
 
-      const cleaned = cleanHtml(rawHtml);
+      const cleaned = cleanHtml(html);
       const hash = generateHash(cleaned);
 
       await supabase
@@ -101,29 +107,36 @@ async function processEvidenceBatch() {
         })
         .eq("id", ev.id);
 
-      console.log(`✅ Salvo: ${ev.id}`);
+      console.log("✅ salvo:", ev.id);
     } catch (err) {
-      console.error(`❌ Erro ao processar ${ev.id}:`, err.message);
+      console.error("❌ falhou:", ev.id);
+
+      // 👇 MARCA COMO FALHA PRA NÃO LOOPAR
+      await supabase
+        .from("evidence_sources")
+        .update({
+          content_snapshot: "FAILED_TO_CAPTURE"
+        })
+        .eq("id", ev.id);
     }
   }
 }
 
 // =============================
-// LOOP PRINCIPAL
+// LOOP
 // =============================
 async function startWorker() {
-  console.log("🚀 MediCrossing Worker iniciado");
+  console.log("🚀 Worker iniciado");
 
   while (true) {
     try {
       await processEvidenceBatch();
     } catch (err) {
-      console.error("🔥 Erro no loop:", err.message);
+      console.error("🔥 erro loop:", err.message);
     }
 
     await new Promise((r) => setTimeout(r, LOOP_INTERVAL));
   }
 }
 
-// START
 startWorker();
