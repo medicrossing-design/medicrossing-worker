@@ -1,119 +1,102 @@
-import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
+import fetch from "node-fetch";
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
 
-const LOOP_INTERVAL = 20000;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 // =============================
-// CLEAN
+// CHAMADA IA
 // =============================
-function clean(text) {
-  return text
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 2000);
+async function classifyText(text) {
+  const prompt = `
+You are a regulatory analyst.
+
+Based ONLY on the text below, classify the rule for transporting medication across borders.
+
+Return JSON:
+
+{
+  "status": "PERMITTED | PERMITTED_WITH_RESTRICTION | REQUIRES_PRESCRIPTION_OR_DOCUMENTATION | CONTROLLED_SUBSTANCE | NOT_FOUND_OR_INCONCLUSIVE",
+  "confidence": "LOW | MEDIUM | HIGH",
+  "reason": "short explanation"
 }
 
-// =============================
-// FILTRO
-// =============================
-function isUseful(text) {
-  const t = text.toLowerCase();
+TEXT:
+${text.slice(0, 1500)}
+`;
 
-  return (
-    t.includes("prescription") ||
-    t.includes("controlled") ||
-    t.includes("allowed") ||
-    t.includes("prohibited")
-  );
-}
-
-// =============================
-// FETCH SIMPLES (SEM GOOGLE)
-// =============================
-async function fetchPage(url) {
-  const res = await fetch(url, {
-    headers: { "User-Agent": "Mozilla/5.0" }
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.2
+    })
   });
 
-  if (!res.ok) throw new Error("fail");
+  const json = await res.json();
 
-  return await res.text();
+  const content = json.choices[0].message.content;
+
+  return JSON.parse(content);
 }
 
 // =============================
-// PROCESS
+// PROCESSAR EVIDÊNCIA
 // =============================
-async function processEvent(ev) {
-  const med = ev.normalized_key || ev.medicine_name;
-  const country = ev.destination_country;
-
-  console.log(`🔍 ${med} → ${country}`);
-
-  const { data: sources } = await supabase
-    .from("official_sources")
+async function processEvidence() {
+  const { data } = await supabase
+    .from("evidence_sources")
     .select("*")
-    .eq("country_code", country);
+    .is("classified", null)
+    .limit(3);
 
-  for (const s of sources || []) {
+  for (const ev of data || []) {
     try {
-      console.log("🌐 tentando:", s.base_url);
+      console.log("🧠 analisando:", ev.id);
 
-      const html = await fetchPage(s.base_url);
-      const text = clean(html);
+      const result = await classifyText(ev.content_snapshot);
 
-      if (!isUseful(text)) continue;
-
-      await supabase.from("evidence_sources").insert({
-        source_name: s.source_name,
-        source_url: s.base_url,
-        content_snapshot: text,
-        content_hash: Buffer.from(text).toString("base64").slice(0, 50),
-        country_code: country
+      await supabase.from("curated_decisions").insert({
+        identified_medication_key: "unknown", // vamos melhorar depois
+        country_code: ev.country_code,
+        status: result.status,
+        confidence: result.confidence,
+        source_name: ev.source_name,
+        source_url: ev.source_url,
+        evidence_id: ev.id,
+        review_status: "pending"
       });
 
-      console.log("✅ evidência salva");
+      await supabase
+        .from("evidence_sources")
+        .update({ classified: true })
+        .eq("id", ev.id);
 
-      break;
-    } catch (e) {
-      console.log("❌ falha fonte");
+      console.log("✅ classificado:", result.status);
+    } catch (err) {
+      console.log("❌ erro IA");
     }
   }
-
-  // 🔥 MARCA COMO PROCESSADO (CRÍTICO)
-  await supabase
-    .from("search_events")
-    .update({ result_status: "PROCESSED" })
-    .eq("id", ev.id);
 }
 
 // =============================
 // LOOP
 // =============================
 async function run() {
-  console.log("🚀 Worker estável iniciado");
+  console.log("🚀 CLASSIFIER iniciado");
 
   while (true) {
-    const { data } = await supabase
-      .from("search_events")
-      .select("*")
-      .eq("result_status", "NOT_FOUND_OR_INCONCLUSIVE")
-      .limit(2);
-
-    if (!data || data.length === 0) {
-      console.log("😴 nada pendente");
-    }
-
-    for (const ev of data || []) {
-      await processEvent(ev);
-    }
-
-    await new Promise(r => setTimeout(r, LOOP_INTERVAL));
+    await processEvidence();
+    await new Promise(r => setTimeout(r, 10000));
   }
 }
 
