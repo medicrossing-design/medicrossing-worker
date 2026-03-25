@@ -1,183 +1,164 @@
-import { createClient } from "@supabase/supabase-js";
-import fetch from "node-fetch";
+import { createClient } from '@supabase/supabase-js';
+import OpenAI from 'openai';
+import * as cheerio from 'cheerio';
+import fetch from 'node-fetch';
 
-// =============================
-// ENV CHECK
-// =============================
-console.log("ENV CHECK:", {
-  supabaseUrl: !!process.env.SUPABASE_URL,
-  supabaseKey: !!process.env.SUPABASE_KEY,
-  openaiKey: !!process.env.OPENAI_API_KEY
-});
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_ANON_KEY;
+const openaiApiKey = process.env.OPENAI_API_KEY;
 
-if (!process.env.OPENAI_API_KEY) {
-  console.error("❌ OPENAI_API_KEY não encontrada");
-  process.exit(1);
+const supabase = createClient(supabaseUrl, supabaseKey);
+const openai = new OpenAI({ apiKey: openaiApiKey });
+
+const BATCH_SIZE = 5;
+const RETRY_ATTEMPTS = 3;
+const RATE_LIMIT_DELAY = 1000; // 1 second
+
+async function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// =============================
-// SUPABASE
-// =============================
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
-);
-
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
-// =============================
-// CLEAN JSON
-// =============================
-function cleanJson(text) {
-  return text
-    .replace(/```json/g, "")
-    .replace(/```/g, "")
-    .trim();
-}
-
-// =============================
-// CLASSIFICAR TEXTO (IA)
-// =============================
-async function classifyText(text) {
-  const prompt = `
-You are a regulatory analyst.
-
-Based ONLY on the text below, classify the rule for transporting medication across borders.
-
-Return ONLY valid JSON:
-
-{
-  "status": "PERMITTED | PERMITTED_WITH_RESTRICTION | REQUIRES_PRESCRIPTION_OR_DOCUMENTATION | CONTROLLED_SUBSTANCE | NOT_FOUND_OR_INCONCLUSIVE",
-  "confidence": "LOW | MEDIUM | HIGH",
-  "reason": "short explanation"
-}
-
-TEXT:
-${text.slice(0, 1500)}
-`;
-
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: "Return ONLY valid JSON. No markdown."
-        },
-        {
-          role: "user",
-          content: prompt
-        }
-      ],
-      temperature: 0.2
-    })
-  });
-
-  // erro de API
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`OpenAI error: ${text}`);
-  }
-
-  const json = await res.json();
-
-  const content = json.choices?.[0]?.message?.content;
-
-  if (!content) {
-    throw new Error("Resposta vazia da IA");
-  }
-
-  const cleaned = cleanJson(content);
-
-  try {
-    return JSON.parse(cleaned);
-  } catch (err) {
-    console.error("❌ JSON inválido:", cleaned);
-    throw err;
-  }
-}
-
-// =============================
-// PROCESSAR EVIDÊNCIAS
-// =============================
-async function processEvidence() {
-  const { data, error } = await supabase
-    .from("evidence_sources")
-    .select("*")
-    .is("classified", false)
-    .limit(1); // SAFE pro Railway
-
-  if (error) {
-    console.error("❌ erro ao buscar evidências:", error);
-    return;
-  }
-
-  if (!data || data.length === 0) {
-    console.log("⏳ sem evidências pendentes");
-    return;
-  }
-
-  for (const ev of data) {
+async function fetchWithRetry(url, retries = RETRY_ATTEMPTS) {
+  for (let i = 0; i < retries; i++) {
     try {
-      console.log("🧠 analisando:", ev.id);
-
-      const result = await classifyText(ev.content_snapshot);
-
-      await supabase.from("curated_decisions").insert({
-        identified_medication_key: "unknown",
-        country_code: ev.country_code,
-        status: result.status,
-        confidence: result.confidence,
-        source_name: ev.source_name,
-        source_url: ev.source_url,
-        evidence_id: ev.id,
-        review_status: "pending"
-      });
-
-      await supabase
-        .from("evidence_sources")
-        .update({ classified: true })
-        .eq("id", ev.id);
-
-      console.log("✅ classificado:", result.status);
-
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return await response.text();
     } catch (error) {
-      console.error("❌ erro IA DETALHADO:", {
-        message: error.message,
-        stack: error.stack
-      });
+      console.log(JSON.stringify({ level: 'error', message: `Fetch failed for ${url}, attempt ${i + 1}`, error: error.message }));
+      if (i === retries - 1) throw error;
+      await sleep(1000 * (i + 1)); // Exponential backoff
     }
   }
 }
 
-// =============================
-// LOOP PRINCIPAL (ESTÁVEL)
-// =============================
-async function run() {
-  console.log("🚀 CLASSIFIER iniciado");
+async function processBatch(batch) {
+  for (const item of batch) {
+    try {
+      console.log(JSON.stringify({ level: 'info', message: `Processing evidence_source ID: ${item.id}` }));
+
+      // Fetch URL
+      const html = await fetchWithRetry(item.url);
+
+      // Parse with cheerio
+      const $ = cheerio.load(html);
+      const title = $('title').text() || 'No title';
+      const content = $('body').text().substring(0, 5000); // Limit content
+
+      // Save to source_snapshots
+      const { data: snapshot, error: snapshotError } = await supabase
+        .from('source_snapshots')
+        .insert({
+          evidence_source_id: item.id,
+          url: item.url,
+          title,
+          content,
+          fetched_at: new Date().toISOString()
+        })
+        .select()
+        .single();
+
+      if (snapshotError) throw snapshotError;
+
+      console.log(JSON.stringify({ level: 'info', message: `Saved snapshot for ID: ${item.id}` }));
+
+      // Call OpenAI
+      await sleep(RATE_LIMIT_DELAY);
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'Analyze the following content and decide if it is relevant for medical evidence. Respond with JSON: { "decision": "approve" or "reject", "reason": "brief reason" }' },
+          { role: 'user', content: `Title: ${title}\nContent: ${content}` }
+        ],
+        max_tokens: 200
+      });
+
+      const response = JSON.parse(completion.choices[0].message.content);
+
+      // Save to curated_decisions
+      const { data: decision, error: decisionError } = await supabase
+        .from('curated_decisions')
+        .insert({
+          decision: response.decision,
+          reason: response.reason,
+          model_used: 'gpt-4o-mini',
+          created_at: new Date().toISOString()
+        })
+        .select()
+        .single();
+
+      if (decisionError) throw decisionError;
+
+      console.log(JSON.stringify({ level: 'info', message: `Saved decision for ID: ${item.id}` }));
+
+      // Create decision_evidence_map
+      const { error: mapError } = await supabase
+        .from('decision_evidence_map')
+        .insert({
+          curated_decision_id: decision.id,
+          evidence_source_id: item.id,
+          source_snapshot_id: snapshot.id
+        });
+
+      if (mapError) throw mapError;
+
+      // Mark classified=true
+      const { error: updateError } = await supabase
+        .from('evidence_sources')
+        .update({ classified: true })
+        .eq('id', item.id);
+
+      if (updateError) throw updateError;
+
+      console.log(JSON.stringify({ level: 'info', message: `Marked classified=true for ID: ${item.id}` }));
+
+    } catch (error) {
+      console.log(JSON.stringify({ level: 'error', message: `Failed to process ID: ${item.id}`, error: error.message }));
+    }
+  }
+}
+
+async function main() {
+  console.log(JSON.stringify({ level: 'info', message: 'Worker started' }));
 
   while (true) {
     try {
-      await processEvidence();
-    } catch (err) {
-      console.error("❌ erro no loop:", err);
-    }
+      // Fetch unclassified evidence_sources
+      const { data: batch, error } = await supabase
+        .from('evidence_sources')
+        .select('id, url')
+        .eq('classified', false)
+        .limit(BATCH_SIZE);
 
-    await new Promise(resolve => setTimeout(resolve, 10000));
+      if (error) throw error;
+
+      if (batch.length === 0) {
+        console.log(JSON.stringify({ level: 'info', message: 'No more items to process, sleeping for 10 seconds' }));
+        await sleep(10000);
+        continue;
+      }
+
+      await processBatch(batch);
+
+    } catch (error) {
+      console.log(JSON.stringify({ level: 'error', message: 'Error in main loop', error: error.message }));
+      await sleep(5000);
+    }
   }
 }
 
-// =============================
-// GRACEFUL SHUTDOWN (Railway)
-// =============================
-process.on("SIGTERM", () => {
-  console.log("🛑 Encerrando worker...");
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log(JSON.stringify({ level: 'info', message: 'Received SIGINT, shutting down gracefully' }));
   process.exit(0);
 });
 
-run();
+process.on('SIGTERM', () => {
+  console.log(JSON.stringify({ level: 'info', message: 'Received SIGTERM, shutting down gracefully' }));
+  process.exit(0);
+});
+
+main().catch(error => {
+  console.log(JSON.stringify({ level: 'error', message: 'Unhandled error in main', error: error.message }));
+  process.exit(1);
+});
