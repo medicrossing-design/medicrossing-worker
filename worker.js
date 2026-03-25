@@ -44,7 +44,11 @@ ${text.slice(0, 1500)}
 
   const json = await res.json();
 
-  const content = json.choices[0].message.content;
+  const content = json.choices?.[0]?.message?.content;
+
+  if (!content) {
+    throw new Error("Resposta vazia da IA");
+  }
 
   return JSON.parse(content);
 }
@@ -66,7 +70,7 @@ async function processEvidence() {
       const result = await classifyText(ev.content_snapshot);
 
       await supabase.from("curated_decisions").insert({
-        identified_medication_key: "unknown", // vamos melhorar depois
+        identified_medication_key: "unknown",
         country_code: ev.country_code,
         status: result.status,
         confidence: result.confidence,
@@ -82,13 +86,13 @@ async function processEvidence() {
         .eq("id", ev.id);
 
       console.log("✅ classificado:", result.status);
+
     } catch (error) {
-  console.error("erro IA DETALHADO:", {
-    message: error.message,
-    response: error.response?.data,
-    stack: error.stack
-  });
-}
+      console.error("❌ erro IA DETALHADO:", {
+        message: error.message,
+        response: error.response?.data,
+        stack: error.stack
+      });
     }
   }
 }
@@ -100,7 +104,12 @@ async function run() {
   console.log("🚀 CLASSIFIER iniciado");
 
   while (true) {
-    await processEvidence();
+    try {
+      await processEvidence();
+    } catch (err) {
+      console.error("❌ erro no loop:", err);
+    }
+
     await new Promise(r => setTimeout(r, 10000));
   }
 }
