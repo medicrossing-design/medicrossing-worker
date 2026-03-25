@@ -1,6 +1,23 @@
 import { createClient } from "@supabase/supabase-js";
 import fetch from "node-fetch";
 
+// =============================
+// ENV CHECK
+// =============================
+console.log("ENV CHECK:", {
+  supabaseUrl: !!process.env.SUPABASE_URL,
+  supabaseKey: !!process.env.SUPABASE_KEY,
+  openaiKey: !!process.env.OPENAI_API_KEY
+});
+
+if (!process.env.OPENAI_API_KEY) {
+  console.error("❌ OPENAI_API_KEY não encontrada");
+  process.exit(1);
+}
+
+// =============================
+// SUPABASE
+// =============================
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
@@ -9,7 +26,7 @@ const supabase = createClient(
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 // =============================
-// LIMPAR JSON DA IA (FIX CRÍTICO)
+// CLEAN JSON
 // =============================
 function cleanJson(text) {
   return text
@@ -19,7 +36,7 @@ function cleanJson(text) {
 }
 
 // =============================
-// CHAMADA IA
+// CLASSIFICAR TEXTO (IA)
 // =============================
 async function classifyText(text) {
   const prompt = `
@@ -50,7 +67,7 @@ ${text.slice(0, 1500)}
       messages: [
         {
           role: "system",
-          content: "Return ONLY valid JSON. No markdown, no explanation."
+          content: "Return ONLY valid JSON. No markdown."
         },
         {
           role: "user",
@@ -60,6 +77,12 @@ ${text.slice(0, 1500)}
       temperature: 0.2
     })
   });
+
+  // erro de API
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`OpenAI error: ${text}`);
+  }
 
   const json = await res.json();
 
@@ -71,20 +94,35 @@ ${text.slice(0, 1500)}
 
   const cleaned = cleanJson(content);
 
-  return JSON.parse(cleaned);
+  try {
+    return JSON.parse(cleaned);
+  } catch (err) {
+    console.error("❌ JSON inválido:", cleaned);
+    throw err;
+  }
 }
 
 // =============================
-// PROCESSAR EVIDÊNCIA
+// PROCESSAR EVIDÊNCIAS
 // =============================
 async function processEvidence() {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("evidence_sources")
     .select("*")
     .is("classified", false)
-    .limit(3);
+    .limit(1); // SAFE pro Railway
 
-  for (const ev of data || []) {
+  if (error) {
+    console.error("❌ erro ao buscar evidências:", error);
+    return;
+  }
+
+  if (!data || data.length === 0) {
+    console.log("⏳ sem evidências pendentes");
+    return;
+  }
+
+  for (const ev of data) {
     try {
       console.log("🧠 analisando:", ev.id);
 
@@ -118,7 +156,7 @@ async function processEvidence() {
 }
 
 // =============================
-// LOOP
+// LOOP PRINCIPAL (ESTÁVEL)
 // =============================
 async function run() {
   console.log("🚀 CLASSIFIER iniciado");
@@ -130,8 +168,16 @@ async function run() {
       console.error("❌ erro no loop:", err);
     }
 
-    await new Promise(r => setTimeout(r, 10000));
+    await new Promise(resolve => setTimeout(resolve, 10000));
   }
 }
+
+// =============================
+// GRACEFUL SHUTDOWN (Railway)
+// =============================
+process.on("SIGTERM", () => {
+  console.log("🛑 Encerrando worker...");
+  process.exit(0);
+});
 
 run();
