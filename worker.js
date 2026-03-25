@@ -82,8 +82,13 @@ async function processEvidence() {
         .eq("id", ev.id);
 
       console.log("✅ classificado:", result.status);
-    } catch (err) {
-      console.log("❌ erro IA");
+    } catch (error) {
+  console.error("erro IA DETALHADO:", {
+    message: error.message,
+    response: error.response?.data,
+    stack: error.stack
+  });
+}
     }
   }
 }
