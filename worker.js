@@ -9,6 +9,16 @@ const supabase = createClient(
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 // =============================
+// LIMPAR JSON DA IA (FIX CRÍTICO)
+// =============================
+function cleanJson(text) {
+  return text
+    .replace(/```json/g, "")
+    .replace(/```/g, "")
+    .trim();
+}
+
+// =============================
 // CHAMADA IA
 // =============================
 async function classifyText(text) {
@@ -17,7 +27,7 @@ You are a regulatory analyst.
 
 Based ONLY on the text below, classify the rule for transporting medication across borders.
 
-Return JSON:
+Return ONLY valid JSON:
 
 {
   "status": "PERMITTED | PERMITTED_WITH_RESTRICTION | REQUIRES_PRESCRIPTION_OR_DOCUMENTATION | CONTROLLED_SUBSTANCE | NOT_FOUND_OR_INCONCLUSIVE",
@@ -37,7 +47,16 @@ ${text.slice(0, 1500)}
     },
     body: JSON.stringify({
       model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
+      messages: [
+        {
+          role: "system",
+          content: "Return ONLY valid JSON. No markdown, no explanation."
+        },
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
       temperature: 0.2
     })
   });
@@ -50,7 +69,9 @@ ${text.slice(0, 1500)}
     throw new Error("Resposta vazia da IA");
   }
 
-  return JSON.parse(content);
+  const cleaned = cleanJson(content);
+
+  return JSON.parse(cleaned);
 }
 
 // =============================
@@ -90,7 +111,6 @@ async function processEvidence() {
     } catch (error) {
       console.error("❌ erro IA DETALHADO:", {
         message: error.message,
-        response: error.response?.data,
         stack: error.stack
       });
     }
