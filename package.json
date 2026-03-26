@@ -1,19 +1,10 @@
 {
-  "name": "my-worker-project",
+  "name": "medicrossing-worker",
   "version": "1.0.0",
   "main": "worker.js",
   "type": "module",
-  "engines": {
-    "node": "20.x"
-  },
   "scripts": {
-    "start": "node worker.js",
-    "dev": "node --watch worker.js"
+    "start": "node worker.js"
   },
-  "dependencies": {
-    "@supabase/supabase-js": "^2.39.3",
-    "openai": "^4.28.4",
-    "cheerio": "^1.0.0-rc.12",
-    "node-fetch": "^3.3.2"
-  }
+  "dependencies": {}
 }
