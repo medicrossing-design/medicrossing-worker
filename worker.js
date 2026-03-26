@@ -4,7 +4,7 @@ import * as cheerio from 'cheerio';
 import fetch from 'node-fetch';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_key = process.env.SUPABASE_key;
+const SUPABASE_key = process.env.SUPABASE_ANON_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_key || !OPENAI_API_KEY) {
