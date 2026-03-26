@@ -1,1 +1,0 @@
-node worker.js
