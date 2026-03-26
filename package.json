@@ -11,7 +11,7 @@
     "dev": "node --watch worker.js"
   },
   "dependencies": {
-    "supabase": "^2.39.3",
+    "@supabase/supabase-js": "^2.39.3",
     "openai": "^4.28.4",
     "cheerio": "^1.0.0-rc.12",
     "node-fetch": "^3.3.2"
