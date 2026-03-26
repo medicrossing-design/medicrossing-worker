@@ -1,31 +1,25 @@
-console.log("Worker started");
+console.log("Worker started at " + new Date().toISOString());
 
+let counter = 0;
 const interval = setInterval(() => {
-    console.log(`${new Date().toISOString()}: Worker is alive`);
+    counter++;
+    console.log(`[${counter}] Heartbeat at ${new Date().toISOString()}`);
 }, 5000);
 
-// Graceful shutdown
 process.on('SIGINT', () => {
-    console.log('Received SIGINT, shutting down gracefully');
+    console.log("SIGINT received - shutting down");
     clearInterval(interval);
     process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-    console.log('Received SIGTERM, shutting down gracefully');
+    console.log("SIGTERM received - shutting down");
     clearInterval(interval);
     process.exit(0);
 });
 
-// Catch errors
 process.on('uncaughtException', (err) => {
-    console.error('Uncaught Exception:', err);
-    clearInterval(interval);
-    process.exit(1);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+    console.error("ERROR:", err.message);
     clearInterval(interval);
     process.exit(1);
 });
