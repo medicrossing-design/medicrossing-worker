@@ -2,19 +2,17 @@ import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
 import * as cheerio from 'cheerio';
 import fetch from 'node-fetch';
-import crypto from 'crypto';
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const openaiApiKey = process.env.OPENAI_API_KEY;
-
 const supabase = createClient(supabaseUrl, supabaseKey);
 const openai = new OpenAI({ apiKey: openaiApiKey });
 
-let isShuttingDown = false;
+let isRunning = true;
 
-process.on('SIGINT', () => { isShuttingDown = true; process.exit(0); });
-process.on('SIGTERM', () => { isShuttingDown = true; process.exit(0); });
+process.on('SIGINT', () => { isRunning = false; console.log(JSON.stringify({ event: 'shutdown', reason: 'SIGINT' })); process.exit(0); });
+process.on('SIGTERM', () => { isRunning = false; console.log(JSON.stringify({ event: 'shutdown', reason: 'SIGTERM' })); process.exit(0); });
 
 async function fetchWithRetry(url, retries = 3) {
   for (let i = 0; i < retries; i++) {
@@ -29,103 +27,67 @@ async function fetchWithRetry(url, retries = 3) {
   }
 }
 
-async function processBatch(sources) {
-  const promises = sources.map(async (source) => {
-    if (isShuttingDown) return;
+async function processBatch(batch) {
+  for (const source of batch) {
+    if (!isRunning) break;
     try {
-      const html = await fetchWithRetry(source.url);
-      const $ = cheerio.load(html);
-      const rawText = $('body').text().trim();
-      const contentHash = crypto.createHash('sha256').update(rawText).digest('hex');
+      const rawText = await fetchWithRetry(source.url);
+      const $ = cheerio.load(rawText);
+      const parsedText = $('body').text().trim();
+      if (parsedText.length < 500) {
+        console.log(JSON.stringify({ event: 'skip', source_id: source.id, reason: 'raw_text too short' }));
+        continue;
+      }
       const fetchedAt = new Date().toISOString();
-      const metadataJson = JSON.stringify({ title: $('title').text() });
-
-      const { data: snapshot, error: snapshotError } = await supabase
-        .from('source_snapshots')
-        .insert({
-          source_id: source.id,
-          fetched_at: fetchedAt,
-          raw_text: rawText,
-          content_hash: contentHash,
-          metadata_json: metadataJson
-        })
-        .select('id')
-        .single();
-
-      if (snapshotError) throw snapshotError;
-
-      const prompt = `Analise o texto: ${rawText}. Identifique medicamentos mencionados, país, status e gere explicação em português brasileiro.`;
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 500
-      });
-
-      const response = JSON.parse(completion.choices[0].message.content);
-      const { country_code, identified_medication, status, confidence, plain_language_pt } = response;
-
-      const { data: decision, error: decisionError } = await supabase
-        .from('curated_decisions')
-        .insert({
-          country_code,
-          identified_medication,
-          status,
-          confidence,
-          plain_language_pt,
-          snapshot_id: snapshot.id,
-          source_name: source.name,
-          source_url: source.url,
-          evidence_id: source.evidence_id,
-          review_status: 'pending'
-        })
-        .select('id')
-        .single();
-
-      if (decisionError) throw decisionError;
-
-      await supabase
-        .from('decision_evidence_map')
-        .insert({
-          decision_id: decision.id,
-          evidence_id: source.evidence_id
+      await supabase.from('source_snapshots').insert({ source_id: source.id, raw_text: parsedText, fetched_at: fetchedAt });
+      const prompt = `Analise o texto fornecido e responda estritamente em JSON com as chaves: medicamento_mencionado (sim/não), status (APPROVED/PENDING/REJECTED/UNKNOWN), confianca (0-1). Texto: ${parsedText}`;
+      let aiResponse;
+      try {
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [{ role: 'user', content: prompt }],
+          response_format: { type: 'json_object' }
         });
-
-      await supabase
-        .from('evidence_sources')
-        .update({ classified: true })
-        .eq('id', source.id);
-
-      console.log(JSON.stringify({ level: 'info', message: `Processed source ${source.id}`, timestamp: new Date().toISOString() }));
+        aiResponse = JSON.parse(completion.choices[0].message.content);
+      } catch (error) {
+        aiResponse = { medicamento_mencionado: 'não', status: 'UNKNOWN', confianca: 0 };
+      }
+      const confidence = aiResponse.confianca;
+      let decision;
+      if (confidence < 0.6) continue;
+      if (confidence <= 0.75) decision = 'pending';
+      else decision = 'approved';
+      const auditTrail = {
+        source_url: source.url,
+        raw_text_length: parsedText.length,
+        ai_response: aiResponse,
+        confidence: confidence,
+        decision_at: new Date().toISOString()
+      };
+      const { data: decisionData } = await supabase.from('curated_decisions').insert({
+        source_id: source.id,
+        decision: decision,
+        audit_trail: auditTrail
+      }).select('id');
+      await supabase.from('decision_evidence_map').insert({ decision_id: decisionData[0].id, source_id: source.id });
+      await supabase.from('evidence_sources').update({ classified: true }).eq('id', source.id);
+      console.log(JSON.stringify({ event: 'processed', source_id: source.id, decision: decision }));
     } catch (error) {
-      console.log(JSON.stringify({ level: 'error', message: error.message, source_id: source.id, timestamp: new Date().toISOString() }));
+      console.log(JSON.stringify({ event: 'error', source_id: source.id, error: error.message }));
     }
-  });
-
-  await Promise.all(promises);
-}
-
-async function main() {
-  while (!isShuttingDown) {
-    const { data: sources, error } = await supabase
-      .from('evidence_sources')
-      .select('*')
-      .eq('classified', false)
-      .limit(5);
-
-    if (error) {
-      console.log(JSON.stringify({ level: 'error', message: error.message, timestamp: new Date().toISOString() }));
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      continue;
-    }
-
-    if (sources.length === 0) {
-      await new Promise(resolve => setTimeout(resolve, 5000));
-      continue;
-    }
-
-    await processBatch(sources);
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
 }
 
-main();
+async function main() {
+  while (isRunning) {
+    const { data: sources } = await supabase.from('evidence_sources').select('*').eq('classified', false).limit(5);
+    if (!sources || sources.length === 0) {
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      continue;
+    }
+    await processBatch(sources);
+  }
+}
+
+main().catch(error => console.log(JSON.stringify({ event: 'fatal_error', error: error.message })));
