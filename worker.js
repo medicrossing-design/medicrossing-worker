@@ -68,7 +68,7 @@ async function processBatch(batch) {
         source_id: source.id,
         decision: decision,
         audit_trail: auditTrail
-      }).select('id');
+      }).select('id, source_url');
       await supabase.from('decision_evidence_map').insert({ decision_id: decisionData[0].id, source_id: source.id });
       await supabase.from('evidence_sources').update({ classified: true }).eq('id', source.id);
       console.log(JSON.stringify({ event: 'processed', source_id: source.id, decision: decision }));
