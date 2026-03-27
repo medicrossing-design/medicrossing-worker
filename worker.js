@@ -85,7 +85,7 @@ async function processBatch(batch) {
       
       let html;
       try {
-        console.log(`[FETCH] Starting (8s timeout)...`);
+        console.log(`[FETCH] Starting...`);
         html = await fetchWithTimeout(source.source_url, 8000);
         console.log(`[FETCH] Success: ${html.length} bytes`);
       } catch (error) {
@@ -107,7 +107,6 @@ async function processBatch(batch) {
       const content_hash = computeHash(raw_text);
       const fetched_at = new Date().toISOString();
       
-      // SALVAR SNAPSHOT PRIMEIRO
       const { data: snapshot, error: snapError } = await supabase
         .from('source_snapshots')
         .insert({ 
@@ -127,9 +126,9 @@ async function processBatch(batch) {
         continue;
       }
       
-      console.log(`[SNAPSHOT] Saved with ID: ${snapshot.id}`);
+      console.log(`[SNAPSHOT] Saved ID: ${snapshot.id}`);
 
-      const prompt = `Analise o texto e responda APENAS em JSON: {"medicamento_mencionado": "SIM" ou "NÃO", "status": "PERMITTED" ou "CONTROLLED_SUBSTANCE" ou "REQUIRES_PRESCRIPTION_OR_DOCUMENTATION" ou "UNKNOWN", "confianca": "LOW" ou "MEDIUM" ou "HIGH"}. Texto: ${raw_text.substring(0, 2000)}`;
+      const prompt = `Responda APENAS em JSON: {"medicamento_mencionado": "SIM" ou "NAO", "status": "PERMITTED" ou "CONTROLLED_SUBSTANCE" ou "REQUIRES_PRESCRIPTION_OR_DOCUMENTATION" ou "UNKNOWN", "confianca": "LOW" ou "MEDIUM" ou "HIGH"}. Texto: ${raw_text.substring(0, 2000)}`;
 
       console.log(`[AI] Calling...`);
       const aiResponse = await openai.chat.completions.create({
@@ -144,14 +143,13 @@ async function processBatch(batch) {
         parsed = JSON.parse(aiText);
       } catch (e) {
         console.log(`[AI] Parse failed, using fallback`);
-        parsed = { medicamento_mencionado: 'NÃO', status: 'UNKNOWN', confianca: 'LOW' };
+        parsed = { medicamento_mencionado: 'NAO', status: 'UNKNOWN', confianca: 'LOW' };
       }
 
-      console.log(`[AI] Response: med=${parsed.medicamento_mencionado}, status=${parsed.status}, conf=${parsed.confianca}`);
+      console.log(`[AI] med=${parsed.medicamento_mencionado}, status=${parsed.status}, conf=${parsed.confianca}`);
 
       const { medicamento_mencionado, status, confianca } = parsed;
       
-      // Validar confidence é um dos enums esperados
       const validConfidence = ['LOW', 'MEDIUM', 'HIGH'].includes(confianca) ? confianca : 'LOW';
       const validStatus = ['PERMITTED', 'CONTROLLED_SUBSTANCE', 'REQUIRES_PRESCRIPTION_OR_DOCUMENTATION', 'UNKNOWN'].includes(status) ? status : 'UNKNOWN';
       
@@ -162,39 +160,31 @@ async function processBatch(batch) {
       }
 
       const review_status = validConfidence === 'MEDIUM' ? 'pending' : 'approved';
-      
-      // CRIAR identified_medication_key (slug normalizado)
-      const identified_medication_key = medicamento_mencionado === 'SIM' ? 'sim' : 'nao';
+      const identified_medication_key = (medicamento_mencionado === 'SIM' ? 'sim' : 'nao') + '-' + (source.country_code || 'UNKNOWN').toLowerCase();
+      let confidence_score;
+      if (validConfidence === 'HIGH') confidence_score = 0.85;
+      else if (validConfidence === 'MEDIUM') confidence_score = 0.65;
+      else confidence_score = 0.35;
 
-      // INSERIR DECISION COM TODOS OS CAMPOS OBRIGATÓRIOS
       const { error: decisionError } = await supabase
         .from('curated_decisions')
         .insert({
           country_code: source.country_code || 'UNKNOWN',
-          identified_medication: medicamento_mencionado === 'SIM' ? 'Sim' : 'Não',
+          identified_medication: medicamento_mencionado === 'SIM' ? 'Sim' : 'Nao',
           identified_medication_key: identified_medication_key,
           status: validStatus,
           confidence: validConfidence,
-          conditions_json: {
-            source_name: source.source_name,
-            source_url: source.source_url,
-            fetched_at: fetched_at,
-            text_length: raw_text.length
-          },
-          plain_language_pt: `Baseado em ${source.source_name}, o status regulatório é ${validStatus}.`,
-          plain_language_en: `Based on ${source.source_name}, the regulatory status is ${validStatus}.`,
+          conditions_json: { source_name: source.source_name, source_url: source.source_url, fetched_at },
+          plain_language_pt: `Baseado em ${source.source_name}, o status é ${validStatus}.`,
+          plain_language_en: `Based on ${source.source_name}, status is ${validStatus}.`,
           primary_source_id: source.id,
           snapshot_id: snapshot.id,
           review_status: review_status,
           source_name: source.source_name,
           source_url: source.source_url,
-          confidence_score: validConfidence === 'HIGH' ? 0.85 : (validConfidence === 'MEDIUM' ? 0.65 : 0.35),
+          confidence_score: confidence_score,
           evidence_id: source.id,
-          audit_trail: {
-            ai_response: aiText,
-            raw_text_length: raw_text.length,
-            processed_at: new Date().toISOString()
-          }
+          audit_trail: { ai_response: aiText, processed_at: fetched_at }
         });
 
       if (decisionError) {
