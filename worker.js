@@ -27,11 +27,24 @@ process.on('SIGTERM', () => {
   isRunning = false;
 });
 
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.5',
+  'Accept-Encoding': 'gzip, deflate',
+  'DNT': '1',
+  'Connection': 'keep-alive',
+  'Upgrade-Insecure-Requests': '1'
+};
+
 async function fetchWithRetry(url, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {
       console.log(`[FETCH] Attempt ${i + 1}/${retries}: ${url}`);
-      const response = await fetch(url, { timeout: 10000 });
+      const response = await fetch(url, { 
+        timeout: 10000,
+        headers: HEADERS
+      });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const text = await response.text();
       console.log(`[FETCH] Success: ${text.length} chars`);
@@ -39,8 +52,20 @@ async function fetchWithRetry(url, retries = 3) {
     } catch (error) {
       console.log(`[FETCH] Failed: ${error.message}`);
       if (i === retries - 1) throw error;
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, 2000 * (i + 1)));
     }
+  }
+}
+
+async function updateClassified(sourceId) {
+  try {
+    const { error } = await supabase
+      .from('evidence_sources')
+      .update({ classified: true })
+      .eq('id', sourceId);
+    if (error) throw error;
+  } catch (error) {
+    console.log(`[UPDATE ERROR] ${sourceId}: ${error.message}`);
   }
 }
 
@@ -57,7 +82,7 @@ async function processBatch(batch) {
 
       if (raw_text.length < 500) {
         console.log(`[SKIP] Text too short (${raw_text.length} < 500)`);
-        await supabase.from('evidence_sources').update({ classified: true }).eq('id', source.id);
+        await updateClassified(source.id);
         continue;
       }
 
@@ -95,7 +120,7 @@ async function processBatch(batch) {
 
       if (confianca < 0.6) {
         console.log(`[CONFIDENCE] Too low (${confianca} < 0.6), skipping`);
-        await supabase.from('evidence_sources').update({ classified: true }).eq('id', source.id);
+        await updateClassified(source.id);
         continue;
       } else if (confianca <= 0.75) {
         review_status = 'pending';
@@ -126,12 +151,12 @@ async function processBatch(batch) {
         audit_trail: audit_trail
       });
 
-      await supabase.from('evidence_sources').update({ classified: true }).eq('id', source.id);
+      await updateClassified(source.id);
       console.log(`[DONE] Source ${source.id} completed`);
 
     } catch (error) {
       console.log(`[ERROR] ${source.id}: ${error.message}`);
-      await supabase.from('evidence_sources').update({ classified: true }).eq('id', source.id).catch(() => {});
+      await updateClassified(source.id);
     }
   }
 }
