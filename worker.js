@@ -13,23 +13,31 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 let isRunning = true;
 
+console.log('=== WORKER START ===');
+console.log(`SUPABASE_URL: ${SUPABASE_URL}`);
+console.log(`OPENAI_MODEL: ${OPENAI_MODEL}`);
+
 process.on('SIGINT', () => {
-  console.log(JSON.stringify({ level: 'info', message: 'Received SIGINT, shutting down gracefully' }));
+  console.log('SIGINT received');
   isRunning = false;
 });
 
 process.on('SIGTERM', () => {
-  console.log(JSON.stringify({ level: 'info', message: 'Received SIGTERM, shutting down gracefully' }));
+  console.log('SIGTERM received');
   isRunning = false;
 });
 
 async function fetchWithRetry(url, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {
+      console.log(`[FETCH] Attempt ${i + 1}/${retries}: ${url}`);
       const response = await fetch(url, { timeout: 10000 });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return await response.text();
+      const text = await response.text();
+      console.log(`[FETCH] Success: ${text.length} chars`);
+      return text;
     } catch (error) {
+      console.log(`[FETCH] Failed: ${error.message}`);
       if (i === retries - 1) throw error;
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
@@ -37,14 +45,18 @@ async function fetchWithRetry(url, retries = 3) {
 }
 
 async function processBatch(batch) {
+  console.log(`[BATCH] Processing ${batch.length} sources`);
   for (const source of batch) {
     if (!isRunning) break;
     try {
+      console.log(`[SOURCE] ${source.id}: ${source.source_url}`);
       const html = await fetchWithRetry(source.source_url);
       const $ = cheerio.load(html);
       const raw_text = $('body').text().trim();
+      console.log(`[PARSE] ${raw_text.length} chars extracted`);
 
       if (raw_text.length < 500) {
+        console.log(`[SKIP] Text too short (${raw_text.length} < 500)`);
         await supabase.from('evidence_sources').update({ classified: true }).eq('id', source.id);
         continue;
       }
@@ -57,9 +69,11 @@ async function processBatch(batch) {
         .insert({ source_id: source.id, raw_text, fetched_at, metadata_json });
 
       if (snapshotError) throw snapshotError;
+      console.log(`[SNAPSHOT] Saved`);
 
       const prompt = `Analise o texto e responda APENAS em JSON: {"medicamento_mencionado": "SIM" ou "NÃO", "status": "PERMITTED" ou "CONTROLLED" ou "RESTRICTED" ou "UNKNOWN", "confianca": 0 a 1}. Texto: ${raw_text.substring(0, 2000)}`;
 
+      console.log(`[AI] Calling OpenAI...`);
       const aiResponse = await openai.chat.completions.create({
         model: OPENAI_MODEL,
         messages: [{ role: 'user', content: prompt }],
@@ -67,16 +81,20 @@ async function processBatch(batch) {
       });
 
       const aiText = aiResponse.choices[0].message.content.trim();
-      let parsed = { medicamento_mencionado: 'NÃO', status: 'UNKNOWN', confianca: 0 };
+      console.log(`[AI] Response: ${aiText}`);
 
+      let parsed = { medicamento_mencionado: 'NÃO', status: 'UNKNOWN', confianca: 0 };
       try {
         parsed = JSON.parse(aiText);
-      } catch (e) {}
+      } catch (e) {
+        console.log(`[AI] Parse failed, using fallback`);
+      }
 
       const { medicamento_mencionado, status, confianca } = parsed;
       let review_status;
 
       if (confianca < 0.6) {
+        console.log(`[CONFIDENCE] Too low (${confianca} < 0.6), skipping`);
         await supabase.from('evidence_sources').update({ classified: true }).eq('id', source.id);
         continue;
       } else if (confianca <= 0.75) {
@@ -93,6 +111,7 @@ async function processBatch(batch) {
         decision_at: new Date().toISOString()
       });
 
+      console.log(`[DECISION] Saving with status: ${review_status}`);
       await supabase.from('curated_decisions').insert({
         evidence_id: source.id,
         country_code: source.country_code,
@@ -108,9 +127,10 @@ async function processBatch(batch) {
       });
 
       await supabase.from('evidence_sources').update({ classified: true }).eq('id', source.id);
+      console.log(`[DONE] Source ${source.id} completed`);
 
     } catch (error) {
-      console.error(`Error processing source ${source.id}:`, error.message);
+      console.log(`[ERROR] ${source.id}: ${error.message}`);
       await supabase.from('evidence_sources').update({ classified: true }).eq('id', source.id).catch(() => {});
     }
   }
@@ -120,6 +140,7 @@ async function main() {
   console.log(`Worker initialized with OpenAI ${OPENAI_MODEL}`);
   while (isRunning) {
     try {
+      console.log(`[LOOP] Fetching batch...`);
       const { data: batch, error } = await supabase
         .from('evidence_sources')
         .select('*')
@@ -128,22 +149,25 @@ async function main() {
 
       if (error) throw error;
 
+      console.log(`[LOOP] Found ${batch.length} sources`);
       if (batch.length === 0) {
+        console.log(`[LOOP] Nothing to do, sleeping 5s`);
         await new Promise(resolve => setTimeout(resolve, 5000));
         continue;
       }
 
       await processBatch(batch);
+      console.log(`[LOOP] Batch done, sleeping 1s`);
       await new Promise(resolve => setTimeout(resolve, 1000));
 
     } catch (error) {
-      console.error(`Main loop error: ${error.message}`);
+      console.log(`[MAIN ERROR] ${error.message}`);
       await new Promise(resolve => setTimeout(resolve, 5000));
     }
   }
 }
 
 main().catch(error => {
-  console.error(`Fatal error: ${error.message}`);
+  console.log(`[FATAL] ${error.message}`);
   process.exit(1);
 });
