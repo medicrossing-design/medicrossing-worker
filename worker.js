@@ -53,6 +53,16 @@ async function fetchWithTimeout(url, timeoutMs = 8000) {
   }
 }
 
+function computeHash(text) {
+  let hash = 0;
+  for (let i = 0; i &lt; text.length; i++) {
+    const char = text.charCodeAt(i);
+    hash = ((hash &lt;< 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return Math.abs(hash).toString(16);
+}
+
 async function updateClassified(sourceId, status = 'error') {
   try {
     await supabase
@@ -88,22 +98,28 @@ async function processBatch(batch) {
       const raw_text = $('body').text().trim();
       console.log(`[PARSE] ${raw_text.length} chars`);
 
-      if (raw_text.length < 100) {
+      if (raw_text.length &lt; 100) {
         console.log(`[SKIP] Too short`);
         await updateClassified(source.id, 'short');
         continue;
       }
 
+      const content_hash = computeHash(raw_text);
       const fetched_at = new Date().toISOString();
       
-      const { error: snapError } = await supabase
+      // SALVAR SNAPSHOT PRIMEIRO
+      const { data: snapshot, error: snapError } = await supabase
         .from('source_snapshots')
         .insert({ 
           source_id: source.id, 
           raw_text, 
           fetched_at,
-          metadata_json: JSON.stringify({ url: source.source_url })
-        });
+          content_hash: content_hash,
+          metadata_json: { url: source.source_url, fetched_at },
+          http_status: 200
+        })
+        .select('id')
+        .single();
 
       if (snapError) {
         console.log(`[SNAPSHOT] Error: ${snapError.message}`);
@@ -111,44 +127,81 @@ async function processBatch(batch) {
         continue;
       }
       
-      console.log(`[SNAPSHOT] Saved`);
+      console.log(`[SNAPSHOT] Saved with ID: ${snapshot.id}`);
 
-      const prompt = `Responda APENAS em JSON: {"medicamento_mencionado": "SIM" ou "NÃO", "status": "PERMITTED" ou "CONTROLLED" ou "RESTRICTED" ou "UNKNOWN", "confianca": 0-1}. Texto: ${raw_text.substring(0, 1500)}`;
+      const prompt = `Analise o texto e responda APENAS em JSON: {"medicamento_mencionado": "SIM" ou "NÃO", "status": "PERMITTED" ou "CONTROLLED_SUBSTANCE" ou "REQUIRES_PRESCRIPTION_OR_DOCUMENTATION" ou "UNKNOWN", "confianca": "LOW" ou "MEDIUM" ou "HIGH"}. Texto: ${raw_text.substring(0, 2000)}`;
 
       console.log(`[AI] Calling...`);
       const aiResponse = await openai.chat.completions.create({
         model: OPENAI_MODEL,
         messages: [{ role: 'user', content: prompt }],
-        max_tokens: 100
+        max_tokens: 150
       });
 
       const aiText = aiResponse.choices[0].message.content.trim();
-      let parsed = JSON.parse(aiText);
-      console.log(`[AI] conf=${parsed.confianca}`);
+      let parsed;
+      try {
+        parsed = JSON.parse(aiText);
+      } catch (e) {
+        console.log(`[AI] Parse failed, using fallback`);
+        parsed = { medicamento_mencionado: 'NÃO', status: 'UNKNOWN', confianca: 'LOW' };
+      }
+
+      console.log(`[AI] Response: med=${parsed.medicamento_mencionado}, status=${parsed.status}, conf=${parsed.confianca}`);
 
       const { medicamento_mencionado, status, confianca } = parsed;
       
-      if (confianca < 0.5) {
+      // Validar confidence é um dos enums esperados
+      const validConfidence = ['LOW', 'MEDIUM', 'HIGH'].includes(confianca) ? confianca : 'LOW';
+      const validStatus = ['PERMITTED', 'CONTROLLED_SUBSTANCE', 'REQUIRES_PRESCRIPTION_OR_DOCUMENTATION', 'UNKNOWN'].includes(status) ? status : 'UNKNOWN';
+      
+      if (validConfidence === 'LOW') {
         console.log(`[SKIP] Confidence too low`);
         await updateClassified(source.id, 'low_conf');
         continue;
       }
 
-      const review_status = confianca < 0.75 ? 'pending' : 'approved';
+      const review_status = validConfidence === 'MEDIUM' ? 'pending' : 'approved';
+      
+      // CRIAR identified_medication_key (slug normalizado)
+      const identified_medication_key = medicamento_mencionado === 'SIM' ? 'sim' : 'nao';
 
-      await supabase.from('curated_decisions').insert({
-        evidence_id: source.id,
-        country_code: source.country_code || 'UNKNOWN',
-        identified_medication: medicamento_mencionado === 'SIM' ? 'Sim' : 'Não',
-        status: status,
-        confidence: confianca,
-        plain_language_pt: `${source.source_name}: ${status} (${(confianca*100).toFixed(0)}%)`,
-        snapshot_id: source.id,
-        review_status: review_status,
-        source_name: source.source_name,
-        source_url: source.source_url,
-        audit_trail: JSON.stringify({ ai_response: aiText })
-      });
+      // INSERIR DECISION COM TODOS OS CAMPOS OBRIGATÓRIOS
+      const { error: decisionError } = await supabase
+        .from('curated_decisions')
+        .insert({
+          country_code: source.country_code || 'UNKNOWN',
+          identified_medication: medicamento_mencionado === 'SIM' ? 'Sim' : 'Não',
+          identified_medication_key: identified_medication_key,
+          status: validStatus,
+          confidence: validConfidence,
+          conditions_json: {
+            source_name: source.source_name,
+            source_url: source.source_url,
+            fetched_at: fetched_at,
+            text_length: raw_text.length
+          },
+          plain_language_pt: `Baseado em ${source.source_name}, o status regulatório é ${validStatus}.`,
+          plain_language_en: `Based on ${source.source_name}, the regulatory status is ${validStatus}.`,
+          primary_source_id: source.id,
+          snapshot_id: snapshot.id,
+          review_status: review_status,
+          source_name: source.source_name,
+          source_url: source.source_url,
+          confidence_score: validConfidence === 'HIGH' ? 0.85 : (validConfidence === 'MEDIUM' ? 0.65 : 0.35),
+          evidence_id: source.id,
+          audit_trail: {
+            ai_response: aiText,
+            raw_text_length: raw_text.length,
+            processed_at: new Date().toISOString()
+          }
+        });
+
+      if (decisionError) {
+        console.log(`[DECISION] Error: ${decisionError.message}`);
+        await updateClassified(source.id, 'decision_error');
+        continue;
+      }
 
       await updateClassified(source.id, 'success');
       console.log(`[DONE] ${source.source_name}\n`);
