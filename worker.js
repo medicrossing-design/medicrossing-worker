@@ -1,237 +1,174 @@
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
 import * as cheerio from 'cheerio';
-import fetch from 'node-fetch';
+import crypto from 'crypto';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = 'gpt-4o-mini';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-let isRunning = true;
-
-console.log('=== WORKER START ===');
-
-process.on('SIGINT', () => {
-  console.log('[SIGNAL] SIGINT, shutting down');
-  isRunning = false;
-  setTimeout(() => process.exit(0), 2000);
-});
+let isShuttingDown = false;
 
 process.on('SIGTERM', () => {
-  console.log('[SIGNAL] SIGTERM, shutting down');
-  isRunning = false;
-  setTimeout(() => process.exit(0), 2000);
+  console.log('Received SIGTERM, initiating graceful shutdown...');
+  isShuttingDown = true;
 });
 
-const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-};
+process.on('SIGINT', () => {
+  console.log('Received SIGINT, initiating graceful shutdown...');
+  isShuttingDown = true;
+});
 
-async function fetchWithTimeout(url, timeoutMs = 8000) {
+async function fetchWithTimeout(url, timeout = 8000) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
   try {
-    const response = await fetch(url, {
-      headers: HEADERS,
-      signal: controller.signal,
-      follow: 2
-    });
+    const response = await fetch(url, { signal: controller.signal });
     clearTimeout(timeoutId);
-    
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    
-    const text = await response.text();
-    return text.substring(0, 50000);
+    return response;
   } catch (error) {
     clearTimeout(timeoutId);
     throw error;
   }
 }
 
-function computeHash(text) {
-  let hash = 0;
-  for (let i = 0; i &lt; text.length; i++) {
-    const char = text.charCodeAt(i);
-    hash = ((hash &lt;< 5) - hash) + char;
-    hash = hash & hash;
-  }
-  return Math.abs(hash).toString(16);
+function extractText(html) {
+  const $ = cheerio.load(html);
+  return $('body').text().trim();
 }
 
-async function updateClassified(sourceId, status = 'error') {
+function calculateHash(text) {
+  return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+async function processSource(source) {
+  console.log(`Processing source ID: ${source.id}, URL: ${source.url}`);
+
   try {
-    await supabase
-      .from('evidence_sources')
-      .update({ classified: true })
-      .eq('id', sourceId);
-  } catch (e) {
-    console.log(`[UPDATE] Failed: ${e.message}`);
-  }
-}
+    const response = await fetchWithTimeout(source.url);
+    const html = await response.text();
+    const rawText = extractText(html);
+    const contentHash = calculateHash(rawText);
+    const fetchedAt = new Date().toISOString();
+    const metadataJson = JSON.stringify({ userAgent: 'MediCrossingWorker/1.0' });
+    const httpStatus = response.status;
 
-async function processBatch(batch) {
-  console.log(`[BATCH] Processing ${batch.length} sources`);
-  
-  for (const source of batch) {
-    if (!isRunning) break;
-    
-    try {
-      console.log(`[SOURCE] ${source.source_name}`);
-      
-      let html;
-      try {
-        console.log(`[FETCH] Starting...`);
-        html = await fetchWithTimeout(source.source_url, 8000);
-        console.log(`[FETCH] Success: ${html.length} bytes`);
-      } catch (error) {
-        console.log(`[FETCH] Failed: ${error.message}`);
-        await updateClassified(source.id, 'fetch_failed');
-        continue;
-      }
-      
-      const $ = cheerio.load(html);
-      const raw_text = $('body').text().trim();
-      console.log(`[PARSE] ${raw_text.length} chars`);
+    console.log(`Fetched source: status ${httpStatus}, text length: ${rawText.length}`);
 
-      if (raw_text.length &lt; 100) {
-        console.log(`[SKIP] Too short`);
-        await updateClassified(source.id, 'short');
-        continue;
-      }
+    // Save snapshot
+    const { data: snapshot, error: snapshotError } = await supabase
+      .from('source_snapshots')
+      .insert({
+        source_id: source.id,
+        raw_text: rawText,
+        fetched_at: fetchedAt,
+        content_hash: contentHash,
+        metadata_json: metadataJson,
+        http_status: httpStatus,
+      })
+      .select()
+      .single();
 
-      const content_hash = computeHash(raw_text);
-      const fetched_at = new Date().toISOString();
-      
-      const { data: snapshot, error: snapError } = await supabase
-        .from('source_snapshots')
-        .insert({ 
-          source_id: source.id, 
-          raw_text, 
-          fetched_at,
-          content_hash: content_hash,
-          metadata_json: { url: source.source_url, fetched_at },
-          http_status: 200
-        })
-        .select('id')
-        .single();
+    if (snapshotError) {
+      console.error('Error saving snapshot:', snapshotError);
+      return;
+    }
 
-      if (snapError) {
-        console.log(`[SNAPSHOT] Error: ${snapError.message}`);
-        await updateClassified(source.id, 'snap_error');
-        continue;
-      }
-      
-      console.log(`[SNAPSHOT] Saved ID: ${snapshot.id}`);
+    console.log(`Snapshot saved with ID: ${snapshot.id}`);
 
-      const prompt = `Responda APENAS em JSON: {"medicamento_mencionado": "SIM" ou "NAO", "status": "PERMITTED" ou "CONTROLLED_SUBSTANCE" ou "REQUIRES_PRESCRIPTION_OR_DOCUMENTATION" ou "UNKNOWN", "confianca": "LOW" ou "MEDIUM" ou "HIGH"}. Texto: ${raw_text.substring(0, 2000)}`;
+    // Call OpenAI
+    const prompt = `Analyze the following text from a medical source and return a JSON object with exactly these keys: medicamento_mencionado (boolean), status (string: 'approved', 'rejected', 'pending', or 'unknown'), confianca (number between 0 and 1). Text: ${rawText.substring(0, 4000)}`;
 
-      console.log(`[AI] Calling...`);
-      const aiResponse = await openai.chat.completions.create({
-        model: OPENAI_MODEL,
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 150
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0,
+    });
+
+    const aiResponse = JSON.parse(completion.choices[0].message.content);
+    console.log('AI Response:', aiResponse);
+
+    // Insert curated decision
+    const { error: decisionError } = await supabase
+      .from('curated_decisions')
+      .insert({
+        country_code: source.country_code || 'BR',
+        identified_medication: aiResponse.medicamento_mencionado ? 'Unknown' : null,
+        identified_medication_key: null,
+        status: aiResponse.status,
+        confidence: aiResponse.confianca >= 0.8 ? 'high' : aiResponse.confianca >= 0.5 ? 'medium' : 'low',
+        conditions_json: JSON.stringify({}),
+        plain_language_pt: 'Texto em português',
+        plain_language_en: 'Text in English',
+        primary_source_id: source.id,
+        snapshot_id: snapshot.id,
+        review_status: 'pending',
+        source_name: source.name,
+        source_url: source.url,
+        confidence_score: aiResponse.confianca,
+        evidence_id: source.evidence_id,
+        audit_trail: JSON.stringify({ processed_at: new Date().toISOString() }),
       });
 
-      const aiText = aiResponse.choices[0].message.content.trim();
-      let parsed;
-      try {
-        parsed = JSON.parse(aiText);
-      } catch (e) {
-        console.log(`[AI] Parse failed, using fallback`);
-        parsed = { medicamento_mencionado: 'NAO', status: 'UNKNOWN', confianca: 'LOW' };
-      }
-
-      console.log(`[AI] med=${parsed.medicamento_mencionado}, status=${parsed.status}, conf=${parsed.confianca}`);
-
-      const { medicamento_mencionado, status, confianca } = parsed;
-      
-      const validConfidence = ['LOW', 'MEDIUM', 'HIGH'].includes(confianca) ? confianca : 'LOW';
-      const validStatus = ['PERMITTED', 'CONTROLLED_SUBSTANCE', 'REQUIRES_PRESCRIPTION_OR_DOCUMENTATION', 'UNKNOWN'].includes(status) ? status : 'UNKNOWN';
-      
-      if (validConfidence === 'LOW') {
-        console.log(`[SKIP] Confidence too low`);
-        await updateClassified(source.id, 'low_conf');
-        continue;
-      }
-
-      const review_status = validConfidence === 'MEDIUM' ? 'pending' : 'approved';
-      const identified_medication_key = (medicamento_mencionado === 'SIM' ? 'sim' : 'nao') + '-' + (source.country_code || 'UNKNOWN').toLowerCase();
-      let confidence_score;
-      if (validConfidence === 'HIGH') confidence_score = 0.85;
-      else if (validConfidence === 'MEDIUM') confidence_score = 0.65;
-      else confidence_score = 0.35;
-
-      const { error: decisionError } = await supabase
-        .from('curated_decisions')
-        .insert({
-          country_code: source.country_code || 'UNKNOWN',
-          identified_medication: medicamento_mencionado === 'SIM' ? 'Sim' : 'Nao',
-          identified_medication_key: identified_medication_key,
-          status: validStatus,
-          confidence: validConfidence,
-          conditions_json: { source_name: source.source_name, source_url: source.source_url, fetched_at },
-          plain_language_pt: `Baseado em ${source.source_name}, o status é ${validStatus}.`,
-          plain_language_en: `Based on ${source.source_name}, status is ${validStatus}.`,
-          primary_source_id: source.id,
-          snapshot_id: snapshot.id,
-          review_status: review_status,
-          source_name: source.source_name,
-          source_url: source.source_url,
-          confidence_score: confidence_score,
-          evidence_id: source.id,
-          audit_trail: { ai_response: aiText, processed_at: fetched_at }
-        });
-
-      if (decisionError) {
-        console.log(`[DECISION] Error: ${decisionError.message}`);
-        await updateClassified(source.id, 'decision_error');
-        continue;
-      }
-
-      await updateClassified(source.id, 'success');
-      console.log(`[DONE] ${source.source_name}\n`);
-
-    } catch (error) {
-      console.log(`[ERROR] ${error.message}`);
-      await updateClassified(source.id, 'error');
+    if (decisionError) {
+      console.error('Error inserting decision:', decisionError);
+      return;
     }
+
+    console.log('Decision inserted');
+
+    // Mark as classified
+    const { error: updateError } = await supabase
+      .from('evidence_sources')
+      .update({ classified: true })
+      .eq('id', source.id);
+
+    if (updateError) {
+      console.error('Error updating source:', updateError);
+    } else {
+      console.log(`Source ${source.id} marked as classified`);
+    }
+
+  } catch (error) {
+    console.error(`Error processing source ${source.id}:`, error.message);
   }
 }
 
-async function main() {
-  console.log('Worker ready\n');
-  
-  while (isRunning) {
+async function mainLoop() {
+  console.log('Starting MediCrossing worker...');
+
+  while (!isShuttingDown) {
     try {
-      const { data: batch, error } = await supabase
+      const { data: sources, error } = await supabase
         .from('evidence_sources')
         .select('*')
         .eq('classified', false)
-        .limit(5);
+        .limit(1);
 
-      if (error) throw error;
-      if (batch.length === 0) {
-        console.log('[LOOP] Sleeping 10s...');
+      if (error) {
+        console.error('Error fetching sources:', error);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        continue;
+      }
+
+      if (sources.length === 0) {
+        console.log('No unclassified sources found, waiting...');
         await new Promise(resolve => setTimeout(resolve, 10000));
         continue;
       }
 
-      await processBatch(batch);
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      await processSource(sources[0]);
 
     } catch (error) {
-      console.log(`[LOOP ERROR] ${error.message}`);
+      console.error('Error in main loop:', error);
       await new Promise(resolve => setTimeout(resolve, 5000));
     }
   }
+
+  console.log('Worker shutting down gracefully');
 }
 
-main().catch(e => {
-  console.log(`[FATAL] ${e.message}`);
-  process.exit(1);
-});
+mainLoop().catch(console.error);
