@@ -91,6 +91,18 @@ async function processSingleSource(source) {
   let snapshotId = null;
 
   try {
+    const { data: existingSource, error: sourceCheckError } = await supabase
+      .from('evidence_sources')
+      .select('id')
+      .eq('id', source.id)
+      .single();
+
+    if (sourceCheckError || !existingSource) {
+      console.error(`[VALIDATE] Source ${source.id} not found in evidence_sources or error: ${sourceCheckError?.message || 'Not found'}. Marking as classified.`);
+      return;
+    }
+    console.log(`[VALIDATE] Source ${source.id} confirmed to exist.`);
+
     let htmlContent;
     try {
       htmlContent = await fetchWithTimeout(source.source_url);
@@ -104,34 +116,49 @@ async function processSingleSource(source) {
     console.log(`[PARSE] Extracted ${raw_text.length} characters from ${source.id}.`);
 
     if (raw_text.length < 100) {
-      console.log(`[SKIP] Content too short (${raw_text.length} chars) for ${source.id}.`);
+      console.log(`[SKIP] Content too short (${raw_text.length} chars) for ${source.id}. Marking as classified.`);
       return;
     }
 
     const content_hash = computeSha256Hash(raw_text);
     const fetched_at = new Date().toISOString();
     
-    const { data: snapshot, error: snapError } = await supabase
-      .from('source_snapshots')
-      .insert({ 
-        source_id: source.id, 
-        raw_text: raw_text, 
-        fetched_at: fetched_at,
-        http_status: 200,
-        content_hash: content_hash,
-        metadata_json: { url: source.source_url, fetched_at: fetched_at }
-      })
-      .select('id')
-      .single();
+    const MAX_SNAPSHOT_RETRIES = 2;
+    for (let i = 0; i <= MAX_SNAPSHOT_RETRIES; i++) {
+      const { data: snapshot, error: snapError } = await supabase
+        .from('source_snapshots')
+        .insert({ 
+          source_id: source.id, 
+          raw_text: raw_text, 
+          fetched_at: fetched_at,
+          http_status: 200,
+          content_hash: content_hash,
+          metadata_json: { url: source.source_url, fetched_at: fetched_at }
+        })
+        .select('id')
+        .single();
 
-    if (snapError) {
-      console.error(`[SNAPSHOT] Error saving snapshot for ${source.id}:`, snapError.message);
+      if (snapError) {
+        console.error(`[SNAPSHOT] Error saving snapshot for ${source.id} (Attempt ${i + 1}/${MAX_SNAPSHOT_RETRIES + 1}):`, snapError.message);
+        if (i < MAX_SNAPSHOT_RETRIES) {
+          console.log(`[RETRY] Retrying snapshot insertion for ${source.id} in 1s...`);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        } else {
+          console.error(`[SNAPSHOT] Max retries reached for snapshot ${source.id}. Skipping further processing.`);
+          return;
+        }
+      } else {
+        snapshotId = snapshot.id;
+        console.log(`[SNAPSHOT] Saved snapshot ID: ${snapshotId} for source ${source.id}.`);
+        break;
+      }
+    }
+
+    if (!snapshotId) {
       return;
     }
-    snapshotId = snapshot.id;
-    console.log(`[SNAPSHOT] Saved snapshot ID: ${snapshotId} for source ${source.id}.`);
 
-    const textToAnalyze = raw_text.substring(0, 2000);
+    const textToAnalyze = raw_text.substring(0, Math.min(raw_text.length, 2000));
     const prompt = `Analise o texto e responda APENAS em JSON válido com estas chaves exatas: {"medicamento_mencionado": "SIM" ou "NAO", "status": "PERMITTED" ou "CONTROLLED_SUBSTANCE" ou "REQUIRES_PRESCRIPTION_OR_DOCUMENTATION" ou "UNKNOWN", "confianca": "LOW" ou "MEDIUM" ou "HIGH"}. Texto: ${textToAnalyze}`;
 
     console.log(`[AI] Calling OpenAI for source ${source.id}...`);
@@ -139,7 +166,8 @@ async function processSingleSource(source) {
       model: OPENAI_MODEL,
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 150,
-      temperature: 0.3
+      temperature: 0.3,
+      response_format: { type: "json_object" }
     });
 
     const aiText = aiResponse.choices[0].message.content.trim();
@@ -219,6 +247,7 @@ async function main() {
   
   while (isRunning) {
     try {
+      console.log(`[LOOP] Fetching one unclassified source...`);
       const { data: sources, error } = await supabase
         .from('evidence_sources')
         .select('*')
