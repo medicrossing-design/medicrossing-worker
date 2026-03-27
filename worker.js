@@ -4,7 +4,7 @@ import * as cheerio from 'cheerio';
 import fetch from 'node-fetch';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = 'gpt-4o-mini';
 
@@ -127,6 +127,7 @@ async function main() {
         .limit(5);
 
       if (error) throw error;
+
       if (batch.length === 0) {
         await new Promise(resolve => setTimeout(resolve, 5000));
         continue;
