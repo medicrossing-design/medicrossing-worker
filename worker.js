@@ -16,19 +16,10 @@ let isRunning = true;
 
 console.log('=== WORKER START ===');
 
-process.on('SIGINT', () => {
-  console.log('[SIGNAL] SIGINT received');
-  isRunning = false;
-});
+process.on('SIGINT', () => (isRunning = false));
+process.on('SIGTERM', () => (isRunning = false));
 
-process.on('SIGTERM', () => {
-  console.log('[SIGNAL] SIGTERM received');
-  isRunning = false;
-});
-
-const HEADERS = {
-  'User-Agent': 'Mozilla/5.0',
-};
+const HEADERS = { 'User-Agent': 'Mozilla/5.0' };
 
 async function fetchWithTimeout(url, timeoutMs = 8000) {
   const controller = new AbortController();
@@ -52,25 +43,21 @@ async function insertEvidenceAnalysis(payload) {
   const MAX = 2;
 
   for (let i = 0; i <= MAX; i++) {
-    const { error } = await supabase
-      .from('evidence_analysis')
-      .insert(payload);
+    const { error } = await supabase.from('evidence_analysis').insert(payload);
 
     if (!error) {
-      console.log('[EVIDENCE] saved');
+      console.log('[EVIDENCE] saved:', payload.status_found);
       return;
     }
 
-    console.error('[EVIDENCE] error:', error.message);
+    console.error('[EVIDENCE] retry:', error.message);
 
-    if (i < MAX) {
-      await new Promise(r => setTimeout(r, 1000));
-    }
+    if (i < MAX) await new Promise(r => setTimeout(r, 1000));
   }
 }
 
 async function processSingleSource(source) {
-  console.log(`[PROCESS] ${source.id}`);
+  console.log(`[PROCESS] ${source.source_name} (${source.country_code})`);
 
   try {
     const html = await fetchWithTimeout(source.source_url);
@@ -81,37 +68,43 @@ async function processSingleSource(source) {
 
     const snapshotHash = hash(raw);
 
-    const { data: snapshot } = await supabase
+    const { data: snapshot, error: snapshotError } = await supabase
       .from('source_snapshots')
       .insert({
         source_id: source.id,
         raw_text: raw,
         content_hash: snapshotHash,
-        http_status: 200
+        http_status: 200,
+        captured_at: new Date()
       })
       .select('id')
       .single();
+
+    if (snapshotError || !snapshot) {
+      console.error('[SNAPSHOT ERROR]', snapshotError);
+      return;
+    }
 
     const snapshotId = snapshot.id;
 
     const text = raw.substring(0, 2000);
 
-    // =========================
-    // NOVO PROMPT (MELHORADO)
-    // =========================
     const prompt = `
 Você é um especialista regulatório.
 
-Analise o texto abaixo e identifique regras sobre transporte de medicamentos em viagens internacionais.
+Analise regras de transporte de medicamentos em viagens internacionais.
 
-Mesmo que nenhum medicamento específico seja citado, identifique regras gerais (ex: necessidade de receita, substâncias controladas, limites).
+Mesmo sem medicamento específico, identifique:
+- necessidade de receita
+- substâncias controladas
+- restrições gerais
 
-Responda APENAS em JSON:
+Responda JSON:
 
 {
-  "status": "PERMITTED | PERMITTED_WITH_RESTRICTION | REQUIRES_PRESCRIPTION_OR_DOCUMENTATION | CONTROLLED_SUBSTANCE | UNKNOWN",
-  "confidence": "LOW | MEDIUM | HIGH",
-  "excerpt": "trecho relevante do texto"
+  "status": "...",
+  "confidence": "...",
+  "excerpt": "..."
 }
 
 TEXTO:
@@ -137,23 +130,28 @@ ${text}
     const confidence = parsed.confidence || 'LOW';
     const excerpt = parsed.excerpt || raw.substring(0, 500);
 
-    // =========================
-    // NOVO: evidence_analysis
-    // =========================
+    // 🔥 SALVA SEMPRE
     await insertEvidenceAnalysis({
       snapshot_id: snapshotId,
       source_id: source.id,
+
       medication_identified: null,
+      country_code: source.country_code,
+
       status_found: status,
       confidence_extraction: confidence,
+
       relevant_excerpt: excerpt,
+
       source_sentiment: 'official',
-      ia_response_raw: parsed
+
+      ia_response_raw: parsed,
+      ia_model: OPENAI_MODEL,
+      ia_prompt_version: 'v3',
+      ia_temperature: 0.2
     });
 
-    // =========================
-    // DECISION (mantido)
-    // =========================
+    // decisão continua existindo (temporário)
     if (confidence !== 'LOW') {
       await supabase.from('curated_decisions').insert({
         country_code: source.country_code,
@@ -171,7 +169,7 @@ ${text}
       .eq('id', source.id);
 
   } catch (err) {
-    console.error('[ERROR]', err.message);
+    console.error('[PROCESS ERROR]', err.message);
   }
 }
 
